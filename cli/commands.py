@@ -4,12 +4,14 @@ CLI do sistema de ensalamento.
 Uso:
     python -m cli.commands <comando> [opções]
 """
+import json
 import sys
 
 import click
 
 from app.models.excecao import ExcecaoCreate
 from app.repositories import alocacao_repo, excecao_repo, sala_repo, turma_repo
+from app.services.interpretador_ia import interpretar_excecao
 from app.services.scheduler import gerar_ensalamento
 
 
@@ -171,6 +173,70 @@ def exc_remover(excecao_id: int):
     else:
         click.echo(f"Exceção {excecao_id} não encontrada.", err=True)
         sys.exit(1)
+
+
+@cmd_excecao.command("interpretar")
+@click.option("--semestre", required=True, help="Semestre (ex: 2024.1)")
+@click.option(
+    "--descricao",
+    required=True,
+    help='Descreva a exceção em português (ex: "Salas do bloco B não podem ter turmas de medicina")',
+)
+@click.option(
+    "--salvar/--nao-salvar",
+    default=True,
+    help="Salvar automaticamente no banco após interpretar",
+)
+def exc_interpretar(semestre: str, descricao: str, salvar: bool):
+    """
+    Usa IA (Claude) para interpretar uma exceção em linguagem natural
+    e convertê-la em regra JSON estruturada.
+
+    Exemplos:
+    \b
+    excecao interpretar --semestre 2024.1 \\
+        --descricao "Salas do bloco B não podem ser usadas pelo curso de Medicina"
+
+    excecao interpretar --semestre 2024.1 \\
+        --descricao "A turma 42 deve obrigatoriamente usar a sala 7 (lab de química)"
+
+    excecao interpretar --semestre 2024.1 \\
+        --descricao "Turmas com mais de 40 alunos não cabem no bloco A" \\
+        --nao-salvar
+    """
+    click.echo(f"Interpretando exceção para {semestre}...")
+    resultado = interpretar_excecao(descricao, semestre)
+
+    if resultado["status"] == "ERRO":
+        click.echo(f"Erro na IA: {resultado['raw_response']}", err=True)
+        sys.exit(1)
+
+    click.echo(f"\nStatus: {resultado['status']}")
+    click.echo("\nRegras interpretadas:")
+    for i, regra in enumerate(resultado["regras"], 1):
+        click.echo(f"  [{i}] {json.dumps(regra, ensure_ascii=False, indent=4)}")
+
+    if resultado["status"] == "PENDENTE_REVISAO":
+        click.echo(
+            "\nAVISO: A IA nao teve certeza sobre o mapeamento. "
+            "Revise as regras antes de gerar o ensalamento."
+        )
+
+    if salvar:
+        ids: list[int] = []
+        for regra in resultado["regras"]:
+            exc = ExcecaoCreate(
+                semestre=semestre,
+                tipo="GENERICA",
+                descricao_livre=descricao,
+                parametros_json=json.dumps(regra, ensure_ascii=False),
+                status_interpretacao=resultado["status"],
+            )
+            new_id = excecao_repo.criar_excecao(exc)
+            ids.append(new_id)
+        click.echo(f"\nSalvo com ID(s): {ids}")
+    else:
+        click.echo("\nNão salvo (use --salvar para persistir).")
 
 
 # ---------------------------------------------------------------------------

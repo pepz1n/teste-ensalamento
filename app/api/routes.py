@@ -1,12 +1,15 @@
 """Rotas FastAPI do sistema de ensalamento."""
+import json
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.models.alocacao import Alocacao, ResultadoEnsalamento
-from app.models.excecao import ExcecaoCreate, ExcecaoSemestre
+from app.models.excecao import ExcecaoCreate, ExcecaoSemestre, InterpretarRequest
 from app.models.sala import Sala
 from app.models.turma import Turma
 from app.repositories import alocacao_repo, excecao_repo, sala_repo, turma_repo
+from app.services.interpretador_ia import interpretar_excecao
 from app.services.scheduler import gerar_ensalamento
 
 router = APIRouter()
@@ -108,6 +111,53 @@ def deletar_excecao(excecao_id: int):
     if not removido:
         raise HTTPException(status_code=404, detail="Exceção não encontrada")
     return {"mensagem": "Exceção removida"}
+
+
+@router.post(
+    "/excecoes/interpretar",
+    summary="Interpretar exceção em linguagem natural via IA",
+    status_code=201,
+)
+def interpretar(req: InterpretarRequest):
+    """
+    Recebe uma descrição em texto livre de uma exceção/restrição e usa IA
+    (Claude) para converter em regra(s) JSON estruturada(s).
+
+    Se `salvar=true`, persiste automaticamente na tabela EXCECAO_SEMESTRE.
+
+    **Exemplos de descrição:**
+    - "Salas do bloco B não podem ser usadas pelo curso de Medicina"
+    - "A turma 42 deve obrigatoriamente usar o laboratório de química (sala 7)"
+    - "Turmas com mais de 40 alunos não cabem nas salas do bloco A por questões acústicas"
+    """
+    resultado = interpretar_excecao(req.descricao, req.semestre)
+
+    if resultado["status"] == "ERRO":
+        raise HTTPException(status_code=502, detail=f"Erro na IA: {resultado['raw_response']}")
+
+    ids_salvos: list[int] = []
+    if req.salvar:
+        for regra in resultado["regras"]:
+            exc = ExcecaoCreate(
+                semestre=req.semestre,
+                tipo="GENERICA",
+                descricao_livre=req.descricao,
+                parametros_json=json.dumps(regra, ensure_ascii=False),
+                status_interpretacao=resultado["status"],
+            )
+            ids_salvos.append(excecao_repo.criar_excecao(exc))
+
+    return {
+        "semestre": req.semestre,
+        "descricao_original": req.descricao,
+        "regras_interpretadas": resultado["regras"],
+        "status": resultado["status"],
+        "ids_salvos": ids_salvos,
+        "aviso": (
+            "Exceção marcada como PENDENTE_REVISAO — revise antes de gerar o ensalamento."
+            if resultado["status"] == "PENDENTE_REVISAO" else None
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------

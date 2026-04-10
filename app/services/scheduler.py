@@ -9,6 +9,7 @@ Exceções suportadas:
   - SALA_INTERDITADA    : sala removida da pool neste semestre
   - CAPACIDADE_SALA     : capacidade efetiva da sala alterada
   - COMPARTILHAMENTO    : duas turmas dividem a mesma seção (num_alunos somados)
+  - GENERICA            : regra JSON interpretada pelo motor de regras (regra_engine)
 """
 from collections import defaultdict
 
@@ -22,6 +23,7 @@ from app.repositories import (
     sala_repo,
     turma_repo,
 )
+from app.services.regra_engine import ContextoRegras, parsear_regras, sala_fixa_da_turma, sala_permitida_para_turma
 
 
 def _aplicar_excecoes(
@@ -91,20 +93,24 @@ def _ordenar_turmas(turmas: list[Turma], cursos_com_prioridade: set[int]) -> lis
 
 def _melhor_sala(
     candidatas: list[Sala],
-    num_alunos: int,
+    turma: Turma,
     tipo_exigido: str | None,
     bloco_preferido: int | None,
+    ctx_regras: ContextoRegras,
 ) -> Sala | None:
     """
     Best-fit: menor sala que ainda acomoda num_alunos, respeitando
-    tipo e preferência de bloco.
+    tipo, preferência de bloco e regras genéricas.
     """
+    num_alunos = turma.get_num_alunos_efetivo()
+
     def _filtro(sala: Sala) -> bool:
         if sala.get_capacidade_efetiva() < num_alunos:
             return False
         if tipo_exigido and sala.tipo != tipo_exigido:
             return False
-        return True
+        permitida, _ = sala_permitida_para_turma(sala, turma, ctx_regras)
+        return permitida
 
     aptas = [s for s in candidatas if _filtro(s)]
     if not aptas:
@@ -140,19 +146,21 @@ def gerar_ensalamento(semestre: str, limpar_anterior: bool = False) -> Resultado
     curso_para_bloco: dict[int, int] = {p["curso_id"]: p["bloco_id"] for p in prioridades}
     cursos_com_prioridade: set[int] = set(curso_para_bloco.keys())
 
-    # --- Aplicar exceções ---
+    # --- Aplicar exceções estruturadas (tipos fixos) ---
     salas, turmas = _aplicar_excecoes(salas_raw, turmas_raw, excecoes)
+
+    # --- Carregar e parsear regras genéricas ---
+    excecoes_genericas = excecao_repo.listar_excecoes_genericas(semestre)
+    ctx_regras = parsear_regras(excecoes_genericas)
 
     # --- Ordenar turmas ---
     turmas = _ordenar_turmas(turmas, cursos_com_prioridade)
 
+    # --- Mapear sala por id para lookup rápido ---
+    sala_por_id: dict[int, Sala] = {s.id: s for s in salas}
+
     # --- Alocar ---
-    # Controle de ocupação: {horario_id: set(sala_id ocupada)}
     ocupacao: dict[int, set[int]] = defaultdict(set)
-    # Pré-carregar alocações já existentes no semestre
-    salas_ids = {s.id for s in salas}
-    for sala in salas:
-        pass  # (placeholder — ocupação carregada sob demanda abaixo)
 
     alocacoes: list[Alocacao] = []
     conflitos: list[dict] = []
@@ -164,20 +172,48 @@ def gerar_ensalamento(semestre: str, limpar_anterior: bool = False) -> Resultado
 
         turma_totalmente_alocada = True
 
+        # Verificar se a turma tem sala fixa por regra genérica
+        sala_fixa_id = sala_fixa_da_turma(turma, ctx_regras)
+
         for horario in turma.horarios:
-            # Salas já ocupadas neste horário (em memória + já existentes no BD)
             if horario.id not in ocupacao:
                 ocupacao[horario.id] = alocacao_repo.salas_ocupadas_no_horario(semestre, horario.id)
 
-            disponiveis = [s for s in salas if s.id not in ocupacao[horario.id]]
-
-            bloco_pref = curso_para_bloco.get(turma.curso_id)
-            escolhida = _melhor_sala(
-                disponiveis,
-                turma.get_num_alunos_efetivo(),
-                turma.tipo_sala_exigida,
-                bloco_pref,
-            )
+            # Se sala fixa, verificar disponibilidade antes de buscar
+            if sala_fixa_id is not None:
+                if sala_fixa_id in ocupacao[horario.id]:
+                    turma_totalmente_alocada = False
+                    conflitos.append(
+                        {
+                            "turma_id": turma.id,
+                            "disciplina": turma.disciplina_nome,
+                            "horario_id": horario.id,
+                            "motivo": f"sala fixa {sala_fixa_id} já ocupada neste horário",
+                        }
+                    )
+                    continue
+                escolhida = sala_por_id.get(sala_fixa_id)
+                if escolhida is None:
+                    turma_totalmente_alocada = False
+                    conflitos.append(
+                        {
+                            "turma_id": turma.id,
+                            "disciplina": turma.disciplina_nome,
+                            "horario_id": horario.id,
+                            "motivo": f"sala fixa {sala_fixa_id} não encontrada ou interditada",
+                        }
+                    )
+                    continue
+            else:
+                disponiveis = [s for s in salas if s.id not in ocupacao[horario.id]]
+                bloco_pref = curso_para_bloco.get(turma.curso_id)
+                escolhida = _melhor_sala(
+                    disponiveis,
+                    turma,
+                    turma.tipo_sala_exigida,
+                    bloco_pref,
+                    ctx_regras,
+                )
 
             if escolhida is None:
                 turma_totalmente_alocada = False
@@ -186,7 +222,7 @@ def gerar_ensalamento(semestre: str, limpar_anterior: bool = False) -> Resultado
                         "turma_id": turma.id,
                         "disciplina": turma.disciplina_nome,
                         "horario_id": horario.id,
-                        "motivo": "nenhuma sala disponível com capacidade suficiente",
+                        "motivo": "nenhuma sala disponível (capacidade, tipo ou regra genérica)",
                     }
                 )
                 continue
